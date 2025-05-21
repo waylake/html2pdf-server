@@ -13,17 +13,73 @@ const logger = pino({
 
 // PDF 서비스
 class PdfService {
-  async convertHtmlToPdf(html: string, options: any = {}) {
-    logger.info('Starting HTML to PDF conversion');
+  private browser: puppeteer.Browser | null = null;
 
-    const browser = await puppeteer.launch({
-      headless: true, // true로 설정
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  async init() {
+    if (this.browser) {
+      logger.info('Puppeteer browser already initialized.');
+      return;
+    }
+    logger.info('Initializing Puppeteer browser...');
+
+    const defaultArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
+    const envArgs = process.env.PUPPETEER_LAUNCH_ARGS;
+    let launchArgs = defaultArgs;
+
+    if (envArgs) {
+      launchArgs = envArgs.split(',').map(arg => arg.trim());
+      logger.info(`Using Puppeteer launch arguments from environment: ${launchArgs.join(' ')}`);
+    } else {
+      logger.info(`Using default Puppeteer launch arguments: ${defaultArgs.join(' ')}`);
+    }
+
+    this.browser = await puppeteer.launch({
+      headless: true,
+      args: launchArgs // Use the determined arguments
     });
+    logger.info('Puppeteer browser initialized successfully.');
+  }
 
+  async closeBrowser() {
+    if (this.browser) {
+      logger.info('Closing Puppeteer browser...');
+      await this.browser.close();
+      this.browser = null;
+      logger.info('Puppeteer browser closed successfully.');
+    } else {
+      logger.info('Puppeteer browser is not initialized or already closed.');
+    }
+  }
+
+  async fetchHtmlFromUrl(url: string, options: any = {}) {
+    if (!this.browser) {
+      throw new Error('Browser not initialized. Call init() first.');
+    }
+    logger.info(`Fetching HTML from URL: ${url}`);
+    const page = await this.browser.newPage();
     try {
-      const page = await browser.newPage();
+      await page.goto(url, {
+        waitUntil: 'networkidle0',
+        timeout: options.timeout || 30000
+      });
+      return await page.content();
+    } catch (error) {
+      logger.error(error, `Failed to fetch URL: ${url}`);
+      // Specific error handling can be done here or let the caller handle it
+      throw error;
+    } finally {
+      await page.close();
+      logger.info(`Page closed for URL: ${url}`);
+    }
+  }
 
+  async convertHtmlToPdf(html: string, options: any = {}) {
+    if (!this.browser) {
+      throw new Error('Browser not initialized. Call init() first.');
+    }
+    logger.info('Starting HTML to PDF conversion');
+    const page = await this.browser.newPage();
+    try {
       // 뷰포트 크기 설정
       await page.setViewport({
         width: options.width || 1200,
@@ -85,9 +141,11 @@ class PdfService {
       return pdfBuffer;
     } catch (error) {
       logger.error(error, 'Error in PDF conversion');
+      // page.close() will be called in the finally block even if an error occurs
       throw error;
     } finally {
-      await browser.close();
+      await page.close();
+      logger.info('Page closed after PDF conversion.');
     }
   }
 }
@@ -277,28 +335,19 @@ This API allows you to convert HTML content or web URLs to high-quality PDF docu
 
       // URL이 제공된 경우 해당 페이지의 HTML 가져오기
       if (url) {
-        logger.info(`Converting URL to PDF: ${url}`);
-        const browser = await puppeteer.launch({
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        });
+        logger.info(`Fetching content from URL for PDF conversion: ${url}`);
         try {
-          const page = await browser.newPage();
-          await page.goto(url, {
-            waitUntil: 'networkidle0',
-            timeout: options.timeout || 30000
-          });
-          contentToRender = await page.content();
+          contentToRender = await pdfService.fetchHtmlFromUrl(url, options);
         } catch (error) {
           logger.error(error, `Failed to fetch URL: ${url}`);
           set.status = 400;
-          return { error: `Failed to fetch URL: ${error.message}` };
-        } finally {
-          await browser.close();
+          // Ensure error is an instance of Error for message property
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          return { error: `Failed to fetch URL: ${errorMessage}` };
         }
       } else if (html) {
         // HTML 콘텐츠가 제공된 경우
-        logger.info('Converting HTML content to PDF');
+        logger.info('Using provided HTML content for PDF conversion');
         contentToRender = html;
       } else {
         // 둘 다 제공되지 않은 경우 (원래 스키마에 의해 이미 방지되지만, 타입 안전성을 위해 추가)
@@ -318,7 +367,9 @@ This API allows you to convert HTML content or web URLs to high-quality PDF docu
     } catch (error) {
       logger.error(error, 'Failed to convert to PDF');
       set.status = 500;
-      return { error: `Failed to convert to PDF: ${error.message}` };
+      // Ensure error is an instance of Error for message property
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { error: `Failed to convert to PDF: ${errorMessage}` };
     }
   }, {
     body: ConvertSchema.body,
@@ -328,10 +379,40 @@ This API allows you to convert HTML content or web URLs to high-quality PDF docu
       summary: 'Convert HTML or URL to PDF',
       description: 'Converts provided HTML content or web URL to a PDF document with extensive customization options'
     }
-  })
-  .listen(process.env.PORT || 3000);
+  });
 
-logger.info(`Server is running at http://localhost:${app.server?.port}`);
-logger.info(`API documentation available at http://localhost:${app.server?.port}/docs`);
+// Initialize PDF service and start server
+const startServer = async () => {
+  try {
+    await pdfService.init(); // Initialize browser instance
+    await app.listen(process.env.PORT || 3000);
+    logger.info(`Server is running at http://localhost:${app.server?.port}`);
+    logger.info(`API documentation available at http://localhost:${app.server?.port}/docs`);
+  } catch (error) {
+    logger.error(error, 'Failed to start server or initialize PDF service');
+    process.exit(1);
+  }
+};
+
+startServer();
+
+// Graceful shutdown
+const signals = ['SIGINT', 'SIGTERM'] as const;
+signals.forEach(signal => {
+  process.on(signal, async () => {
+    logger.info(`Received ${signal}, shutting down...`);
+    try {
+      await pdfService.closeBrowser(); // Close browser instance
+      if (app && app.server) {
+        await app.stop(); // Stop Elysia server if possible (Elysia's stop method might vary)
+      }
+      logger.info('Server shut down gracefully.');
+      process.exit(0);
+    } catch (error) {
+      logger.error(error, 'Error during graceful shutdown');
+      process.exit(1);
+    }
+  });
+});
 
 export type App = typeof app;
