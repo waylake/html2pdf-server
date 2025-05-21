@@ -7,7 +7,7 @@ WORKDIR /usr/src/app
 # 3. Install Chromium and dependencies
 # Install Chromium and necessary dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium-browser \
+    chromium \
     # Add other common puppeteer dependencies to prevent issues
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Set PUPPETEER_EXECUTABLE_PATH environment variable
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # 5. Install Bun
 RUN npm install -g bun@latest # Using latest, can be pinned to a specific version
