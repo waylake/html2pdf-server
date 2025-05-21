@@ -1,6 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { swagger } from '@elysiajs/swagger';
-import puppeteer from 'puppeteer';
+import puppeteer, { Browser } from 'puppeteer-core'; // Assuming Browser type is needed
+import * as genericPool from 'generic-pool';
 import pino from 'pino';
 
 // 로거 설정
@@ -13,72 +14,139 @@ const logger = pino({
 
 // PDF 서비스
 class PdfService {
-  private browser: puppeteer.Browser | null = null;
+  private pool: genericPool.Pool<Browser> | null = null;
 
   async init() {
-    if (this.browser) {
-      logger.info('Puppeteer browser already initialized.');
+    if (this.pool) {
+      logger.info('Puppeteer browser pool already initialized.');
       return;
     }
-    logger.info('Initializing Puppeteer browser...');
+    logger.info('Initializing Puppeteer browser pool with puppeteer-core...');
 
-    const defaultArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
-    const envArgs = process.env.PUPPETEER_LAUNCH_ARGS;
-    let launchArgs = defaultArgs;
+    // Factory for creating and destroying browser instances for the pool
+    const puppeteerFactory: genericPool.Factory<Browser> = {
+      create: async (): Promise<Browser> => {
+        // Determine the executable path for Chromium
+        const executablePathEnv = process.env.PUPPETEER_EXECUTABLE_PATH;
+        let finalExecutablePath: string | undefined = undefined;
+        if (executablePathEnv) {
+          finalExecutablePath = executablePathEnv;
+        } else {
+          finalExecutablePath = '/usr/bin/chromium-browser'; // Default fallback for Linux environments
+          logger.warn(`Pool: PUPPETEER_EXECUTABLE_PATH environment variable not set. Falling back to default: ${finalExecutablePath}. This should be configured in production if not using the official Docker image.`);
+        }
 
-    if (envArgs) {
-      launchArgs = envArgs.split(',').map(arg => arg.trim());
-      logger.info(`Using Puppeteer launch arguments from environment: ${launchArgs.join(' ')}`);
-    } else {
-      logger.info(`Using default Puppeteer launch arguments: ${defaultArgs.join(' ')}`);
+        // Determine Puppeteer launch arguments
+        const defaultArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
+        const envArgs = process.env.PUPPETEER_LAUNCH_ARGS;
+        let launchArgs = defaultArgs;
+        if (envArgs) {
+          launchArgs = envArgs.split(',').map(arg => arg.trim());
+        }
+        logger.info(`Pool: Creating new browser instance. Executable: ${finalExecutablePath}, Args: ${launchArgs.join(' ')}`);
+        
+        // Launch and return a new browser instance
+        try {
+          const browser = await puppeteer.launch({
+            executablePath: finalExecutablePath,
+            headless: true, // Always run headless in server environments
+            args: launchArgs,
+          });
+          return browser;
+        } catch (error) {
+          logger.error(error, `Pool: Failed to create puppeteer instance with executable path '${finalExecutablePath}' and args: ${launchArgs.join(' ')}`);
+          throw error; // Propagate error to prevent pool from potentially using a bad factory
+        }
+      },
+      // Method to destroy a browser instance when it's removed from the pool
+      destroy: async (browser: Browser): Promise<void> => {
+        logger.info('Pool: Destroying browser instance.');
+        await browser.close();
+      },
+      // Optional: validate method could be added here to check browser health before use
+      // validate: async (browser: Browser): Promise<boolean> => { ... }
+    };
+
+    // Configuration options for the generic-pool
+    const poolOptions: genericPool.Options = {
+      min: parseInt(process.env.PUPPETEER_POOL_MIN || "2"), // Minimum number of browser instances in the pool
+      max: parseInt(process.env.PUPPETEER_POOL_MAX || "5"), // Maximum number of browser instances in the pool
+      acquireTimeoutMillis: parseInt(process.env.PUPPETEER_POOL_ACQUIRE_TIMEOUT_MS || "30000"), // Max time (ms) to wait for a resource from the pool
+      maxWaitingClients: parseInt(process.env.PUPPETEER_POOL_MAX_WAITING_CLIENTS || "10"), // Max number of clients waiting for a resource if the pool is exhausted
+      // testOnBorrow: true, // Could be enabled if a 'validate' method is implemented in the factory
+    };
+    logger.info(`Initializing browser pool with options: Min=${poolOptions.min}, Max=${poolOptions.max}, AcquireTimeout=${poolOptions.acquireTimeoutMillis}ms, MaxWaitingClients=${poolOptions.maxWaitingClients}`);
+
+    try {
+      // Create the browser pool
+      this.pool = genericPool.createPool<Browser>(puppeteerFactory, poolOptions);
+      logger.info('Puppeteer browser pool initialized successfully.');
+    } catch (error) {
+      logger.error(error, 'Failed to create Puppeteer browser pool.');
+      throw error; // Re-throw to prevent server from starting if pool initialization fails
     }
-
-    this.browser = await puppeteer.launch({
-      headless: true,
-      args: launchArgs // Use the determined arguments
-    });
-    logger.info('Puppeteer browser initialized successfully.');
   }
 
-  async closeBrowser() {
-    if (this.browser) {
-      logger.info('Closing Puppeteer browser...');
-      await this.browser.close();
-      this.browser = null;
-      logger.info('Puppeteer browser closed successfully.');
+  async closePool() {
+    if (this.pool) {
+      logger.info('Closing Puppeteer browser pool...');
+      try {
+        // Drain the pool, destroying all resources
+        await this.pool.drain();
+        // Clear any remaining resources (should be empty after drain)
+        await this.pool.clear();
+        this.pool = null;
+        logger.info('Puppeteer browser pool closed successfully.');
+      } catch (error) {
+        logger.error(error, 'Error closing Puppeteer browser pool.');
+      }
     } else {
-      logger.info('Puppeteer browser is not initialized or already closed.');
+      logger.info('Puppeteer browser pool is not initialized or already closed.');
     }
   }
 
   async fetchHtmlFromUrl(url: string, options: any = {}) {
-    if (!this.browser) {
-      throw new Error('Browser not initialized. Call init() first.');
+    if (!this.pool) {
+      throw new Error('Browser pool not initialized. Call init() first.');
     }
-    logger.info(`Fetching HTML from URL: ${url}`);
-    const page = await this.browser.newPage();
+    // Acquire a browser instance from the pool
+    logger.info(`Acquiring browser from pool for URL: ${url}`);
+    const browser = await this.pool.acquire();
+    // Log current pool status for monitoring
+    logger.info(`Browser acquired for URL: ${url}. Pool status: size=${this.pool.size}, available=${this.pool.available}, pending=${this.pool.pending}`);
+    
+    const page = await browser.newPage();
     try {
       await page.goto(url, {
-        waitUntil: 'networkidle0',
-        timeout: options.timeout || 30000
+        waitUntil: 'networkidle0', // Wait until network activity has ceased
+        timeout: options.timeout || 30000 // Configurable page load timeout
       });
       return await page.content();
     } catch (error) {
       logger.error(error, `Failed to fetch URL: ${url}`);
-      // Specific error handling can be done here or let the caller handle it
-      throw error;
+      throw error; // Re-throw the error to be handled by the caller
     } finally {
-      await page.close();
+      await page.close(); // Ensure the page is closed
       logger.info(`Page closed for URL: ${url}`);
+      // Release the browser instance back to the pool
+      if (browser) {
+        await this.pool.release(browser);
+        logger.info(`Browser instance released back to the pool. Pool status: size=${this.pool.size}, available=${this.pool.available}, pending=${this.pool.pending}`);
+      }
     }
   }
 
   async convertHtmlToPdf(html: string, options: any = {}) {
-    if (!this.browser) {
-      throw new Error('Browser not initialized. Call init() first.');
+    if (!this.pool) {
+      throw new Error('Browser pool not initialized. Call init() first.');
     }
-    logger.info('Starting HTML to PDF conversion');
-    const page = await this.browser.newPage();
+    // Acquire a browser instance from the pool
+    logger.info('Acquiring browser from pool for HTML to PDF conversion.');
+    const browser = await this.pool.acquire();
+    // Log current pool status for monitoring
+    logger.info(`Browser acquired for HTML to PDF. Pool status: size=${this.pool.size}, available=${this.pool.available}, pending=${this.pool.pending}`);
+    
+    const page = await browser.newPage();
     try {
       // 뷰포트 크기 설정
       await page.setViewport({
@@ -141,11 +209,15 @@ class PdfService {
       return pdfBuffer;
     } catch (error) {
       logger.error(error, 'Error in PDF conversion');
-      // page.close() will be called in the finally block even if an error occurs
-      throw error;
+      throw error; // Re-throw the error to be handled by the caller
     } finally {
-      await page.close();
+      await page.close(); // Ensure the page is closed
       logger.info('Page closed after PDF conversion.');
+      // Release the browser instance back to the pool
+      if (browser) {
+        await this.pool.release(browser);
+        logger.info(`Browser instance released back to the pool. Pool status: size=${this.pool.size}, available=${this.pool.available}, pending=${this.pool.pending}`);
+      }
     }
   }
 }
@@ -306,6 +378,21 @@ This API allows you to convert HTML content or web URLs to high-quality PDF docu
 - Adjust rendering delays for JavaScript-heavy pages
 - Specify custom filename for the generated PDF
 
+## Optimizations & Concurrency
+
+This service utilizes \`puppeteer-core\` for PDF generation, with the Chromium browser conveniently bundled within its official Docker image. To efficiently handle multiple requests, it implements a pool of browser instances. The behavior of this pool and Puppeteer can be tuned using the following environment variables:
+
+*   \`PUPPETEER_POOL_MIN\`: Minimum number of browser instances to keep in the pool (Default: 2).
+*   \`PUPPETEER_POOL_MAX\`: Maximum number of browser instances the pool can create (Default: 5).
+*   \`PUPPETEER_POOL_ACQUIRE_TIMEOUT_MS\`: Maximum time (in milliseconds) a request will wait for an available browser instance from the pool (Default: 30000).
+*   \`PUPPETEER_POOL_MAX_WAITING_CLIENTS\`: Maximum number of requests that can be queued waiting for a browser instance if the pool is at its maximum capacity (Default: 10).
+*   \`PUPPETEER_LAUNCH_ARGS\`: Custom comma-separated arguments for launching browser instances (e.g., "--disable-gpu,--no-zygote").
+*   \`PUPPETEER_EXECUTABLE_PATH\`: (Informational) Set automatically within the Docker image to the path of the bundled Chromium.
+*   \`LOG_LEVEL\`: Sets the application log level (e.g., 'info', 'debug', 'warn', 'error'. Default: 'info').
+*   \`PORT\`: Port the server listens on (Default: 3000).
+
+These configurations allow for fine-tuning the performance and resource usage of the service based on your deployment environment and expected load.
+
 ## Example Use Cases
 
 - Generate invoices, receipts and financial documents
@@ -402,7 +489,7 @@ signals.forEach(signal => {
   process.on(signal, async () => {
     logger.info(`Received ${signal}, shutting down...`);
     try {
-      await pdfService.closeBrowser(); // Close browser instance
+      await pdfService.closePool(); // Changed from closeBrowser to closePool
       if (app && app.server) {
         await app.stop(); // Stop Elysia server if possible (Elysia's stop method might vary)
       }
@@ -416,3 +503,4 @@ signals.forEach(signal => {
 });
 
 export type App = typeof app;
+export { app, pdfService };
